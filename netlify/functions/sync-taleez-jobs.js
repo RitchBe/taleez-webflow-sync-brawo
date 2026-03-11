@@ -103,9 +103,8 @@ async function taleezFetchAllJobs() {
   const secret = process.env.TALEEZ_API_SECRET;
 
   if (!secret) throw new Error("Missing TALEEZ_API_SECRET");
-  if (!path) throw new Error("Missing TALEEZ_OFFERS_PATH");
 
-  const pageSize = 200; // reduce number of requests
+  const pageSize = 200; // max is 1000 per docs; 200 is safe
   let page = 0;
   const all = [];
 
@@ -113,6 +112,8 @@ async function taleezFetchAllJobs() {
     const url = new URL(`${base}${path}`);
     url.searchParams.set("page", String(page));
     url.searchParams.set("pageSize", String(pageSize));
+    // optionally include details if you want full descriptions in list response:
+    // url.searchParams.set("withDetails", "true");
 
     const res = await fetch(url.toString(), {
       headers: {
@@ -127,11 +128,19 @@ async function taleezFetchAllJobs() {
     }
 
     const data = await res.json();
-    const items = Array.isArray(data) ? data : (data.items || []);
 
+    // Taleez JobList shape: { hasMore: boolean, list: job[] }
+    const items = Array.isArray(data) ? data : (data.list || data.items || []);
     all.push(...items);
 
-    if (items.length < pageSize) break;
+    // Stop condition (preferred): hasMore flag
+    if (typeof data?.hasMore === "boolean") {
+      if (!data.hasMore) break;
+    } else {
+      // Fallback if hasMore isn't present for some reason
+      if (items.length < pageSize) break;
+    }
+
     page += 1;
     await sleep(100);
   }
