@@ -1,8 +1,6 @@
 // netlify/functions/sync-taleez-jobs.js
-// Scheduled by netlify.toml (no @netlify/functions dependency)
 
 const WF_BASE = "https://api.webflow.com/v2";
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function toIsoFromUnixSeconds(sec) {
@@ -64,7 +62,7 @@ async function wfListAllItems(collectionId) {
 }
 
 async function wfBulkCreate(collectionId, items) {
-  // Bulk create staged items (v2 expects { items: [{ fieldData: {...} }, ...] })
+  // Bulk create staged items
   return wfFetch(`/collections/${collectionId}/items`, {
     method: "POST",
     body: { items },
@@ -72,7 +70,7 @@ async function wfBulkCreate(collectionId, items) {
 }
 
 async function wfBulkUpdate(collectionId, items) {
-  // Bulk update staged items (up to 100)
+  // Bulk update staged items
   return wfFetch(`/collections/${collectionId}/items`, {
     method: "PATCH",
     body: { items },
@@ -89,7 +87,6 @@ async function wfPublish(collectionId, itemIds) {
 
 async function wfUnpublish(collectionId, itemIds) {
   if (!itemIds.length) return;
-  // Unpublish live items
   return wfFetch(`/collections/${collectionId}/items/live`, {
     method: "DELETE",
     body: { itemIds },
@@ -104,7 +101,7 @@ async function taleezFetchAllJobs() {
 
   if (!secret) throw new Error("Missing TALEEZ_API_SECRET");
 
-  const pageSize = 200; // max is 1000 per docs; 200 is safe
+  const pageSize = 200;
   let page = 0;
   const all = [];
 
@@ -112,7 +109,7 @@ async function taleezFetchAllJobs() {
     const url = new URL(`${base}${path}`);
     url.searchParams.set("page", String(page));
     url.searchParams.set("pageSize", String(pageSize));
-    // optionally include details if you want full descriptions in list response:
+    // If you want richer list payloads, you can try:
     // url.searchParams.set("withDetails", "true");
 
     const res = await fetch(url.toString(), {
@@ -129,15 +126,13 @@ async function taleezFetchAllJobs() {
 
     const data = await res.json();
 
-    // Taleez JobList shape: { hasMore: boolean, list: job[] }
-    const items = Array.isArray(data) ? data : (data.list || data.items || []);
+    // Taleez JobList: { hasMore: boolean, list: [] }
+    const items = Array.isArray(data) ? data : (data.list || []);
     all.push(...items);
 
-    // Stop condition (preferred): hasMore flag
     if (typeof data?.hasMore === "boolean") {
       if (!data.hasMore) break;
     } else {
-      // Fallback if hasMore isn't present for some reason
       if (items.length < pageSize) break;
     }
 
@@ -149,16 +144,16 @@ async function taleezFetchAllJobs() {
 }
 
 // -------------------- Mapping --------------------
-// IMPORTANT: fieldData keys must match your Webflow CMS field slugs.
+// IMPORTANT: Use Webflow field slugs EXACTLY as in your schema (kebab-case).
 function mapJobToWebflow(job, nowIso) {
   const taleezId = String(job.id);
   const title = job.label || `Job ${taleezId}`;
   const slug = `${slugify(title)}-${taleezId}`.slice(0, 240);
 
-  // Adjust once you confirm Taleez "open" statuses in your account.
-  const isActive =
-    job.visibility === "PUBLIC" &&
-    job.currentStatus !== "DONE";
+  // refine later once you confirm Taleez statuses
+  const isActive = job.visibility === "PUBLIC" && job.currentStatus !== "DONE";
+
+
 
   return {
     fieldData: {
@@ -167,8 +162,8 @@ function mapJobToWebflow(job, nowIso) {
       slug,
 
       // Identity:
-      taleez_id: taleezId,
-      taleez_token: job.token || "",
+      "taleez-id": taleezId,
+      "taleez-token": job.token || "",
 
       // Status:
       status: job.currentStatus || "",
@@ -176,48 +171,50 @@ function mapJobToWebflow(job, nowIso) {
 
       // Job:
       contract: job.contract || "",
-      contract_length_value: job.contractLength ?? null,
-      contract_length_unit: job.contractLengthTimeUnit || "",
-      full_time: !!job.fullTime,
-      work_hours: job.workHours ?? null,
+      "contract-length-value":
+        job.contractLength != null ? String(job.contractLength) : "",
+      "contract-length-unit": job.contractLengthTimeUnit || "",
+      "full-time": !!job.fullTime,
+      "work-hours": job.workHours ?? null,
       remote: !!job.remote,
 
       // Location:
       country: job.country || "",
       city: job.city || "",
-      postal_code: job.postalCode ? String(job.postalCode) : "",
-      location_full: [job.city, job.postalCode, job.country]
+      "postal-code": job.postalCode ? String(job.postalCode) : "",
+      "location-full": [job.city, job.postalCode, job.country]
         .filter(Boolean)
         .join(", "),
-      lat: job.lat ?? null,
-      lng: job.lng ?? null,
+lat: typeof job.lat === "number" ? job.lat : null,
+lng: typeof job.lng === "number" ? job.lng : null,
 
       // Company:
-      company_label: job.companyLabel || "",
-      company_website: job.website || "",
-      company_logo_url: job.logo || "",
-      company_banner_url: job.banner || "",
-
-      // Links:
-      offer_url: job.url || "",
-      apply_url: job.urlApplying || "",
+      "company-label": job.companyLabel || "",
+      "company-website": job.website || "",
+      "company-logo-url": job.logo || "",
+      "company-banner-url": job.banner || "",
+      "company-description": job.companyDescription || "",
 
       // Content:
-      job_description: job.jobDescription || "",
-      profile_description: job.profileDescription || "",
-      company_description: job.companyDescription || "",
+      "job-description": job.jobDescription || "",
+      "profile-description": job.profileDescription || "",
+
+      // Links:
+      "offer-url": job.url || "",
+      "apply-url": job.urlApplying || "",
 
       // Tags:
-      tags_text: Array.isArray(job.tags) ? job.tags.join(", ") : "",
+      "tags-text": Array.isArray(job.tags) ? job.tags.join(", ") : "",
 
       // Dates:
-      created_at: toIsoFromUnixSeconds(job.dateCreation),
-      first_publish_at: toIsoFromUnixSeconds(job.dateFirstPublish),
-      last_publish_at: toIsoFromUnixSeconds(job.dateLastPublish),
+      "created-at": toIsoFromUnixSeconds(job.dateCreation),
+      "first-publish-at": toIsoFromUnixSeconds(job.dateFirstPublish),
+      "last-publish-at": toIsoFromUnixSeconds(job.dateLastPublish),
 
       // Sync fields:
-      is_active: isActive,
-      last_seen_at: nowIso,
+      "is-active": isActive,
+      // NOTE: your schema has last-seen-at as PlainText, so store ISO as string
+      "last-seen-at": nowIso,
     },
   };
 }
@@ -234,30 +231,29 @@ export async function handler(event) {
     const minExpected = Number(process.env.MIN_EXPECTED_COUNT || "0");
     const nowIso = new Date().toISOString();
 
-    // (Optional) detect scheduled run
     const isScheduled = event?.headers?.["x-nf-scheduled"] === "true";
 
-    // 1) Fetch all jobs from Taleez
+    // 1) Taleez jobs
     const jobs = await taleezFetchAllJobs();
 
-    // Safety guardrail: prevent accidental mass-unpublish on API outage
+    // Guardrail
     if (minExpected && jobs.length < minExpected) {
       throw new Error(
         `Safety stop: Taleez returned ${jobs.length} jobs (< ${minExpected}).`
       );
     }
 
-    // 2) Load all existing Webflow items (staged)
+    // 2) Existing Webflow items
     const existing = await wfListAllItems(collectionId);
 
-    // Build lookup: taleez_id -> webflow item id
+    // Map: taleez-id -> webflow item id
     const existingByTaleez = new Map();
     for (const item of existing) {
-      const tId = item?.fieldData?.taleez_id;
+      const tId = item?.fieldData?.["taleez-id"];
       if (tId) existingByTaleez.set(String(tId), item.id);
     }
 
-    // 3) Compute create/update batches and publish list
+    // 3) Prepare create/update and publish list
     const seen = new Set();
     const toCreate = [];
     const toUpdate = [];
@@ -270,51 +266,52 @@ export async function handler(event) {
       const mapped = mapJobToWebflow(job, nowIso);
       const existingId = existingByTaleez.get(tId);
 
+      const active = !!mapped.fieldData["is-active"];
+
       if (existingId) {
         toUpdate.push({ id: existingId, ...mapped });
-        if (mapped.fieldData.is_active) publishIds.push(existingId);
+        if (active) publishIds.push(existingId);
       } else {
         toCreate.push(mapped);
       }
     }
 
-    // 4) Create (staged)
+    // 4) Create staged items
     const createdIdsToPublish = [];
     for (const batch of chunk(toCreate, 100)) {
       const created = await wfBulkCreate(collectionId, batch);
 
-      // Webflow may return created item ids; collect if present
+      // Webflow sometimes returns created items with ids
       const createdItems = created?.items || [];
       for (const it of createdItems) {
-        if (it?.fieldData?.is_active) createdIdsToPublish.push(it.id);
+        if (it?.fieldData?.["is-active"]) createdIdsToPublish.push(it.id);
       }
-
       await sleep(250);
     }
 
-    // 5) Update (staged)
+    // 5) Update staged items
     for (const batch of chunk(toUpdate, 100)) {
       await wfBulkUpdate(collectionId, batch);
       await sleep(250);
     }
 
-    // 6) Publish active items (staged -> live)
+    // 6) Publish active items
     const uniquePublishIds = [...new Set([...publishIds, ...createdIdsToPublish])];
     await wfPublish(collectionId, uniquePublishIds);
 
-    // 7) Soft-delete missing items: mark inactive + unpublish live
+    // 7) Soft delete: mark inactive + unpublish items missing from Taleez list
     const missingIds = [];
     const missingUpdates = [];
 
     for (const item of existing) {
-      const tId = String(item?.fieldData?.taleez_id || "");
+      const tId = String(item?.fieldData?.["taleez-id"] || "");
       if (!tId) continue;
 
       if (!seen.has(tId)) {
         missingIds.push(item.id);
         missingUpdates.push({
           id: item.id,
-          fieldData: { is_active: false },
+          fieldData: { "is-active": false },
         });
       }
     }
