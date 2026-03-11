@@ -3,3 +3,6 @@
 
 [functions]
   directory = "netlify/functions"
+
+[functions."sync-taleez-jobs"]
+  schedule = "*/30 * * * *"
