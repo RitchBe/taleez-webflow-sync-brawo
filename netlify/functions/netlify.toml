@@ -5,4 +5,4 @@
   directory = "netlify/functions"
 
 [functions."sync-taleez-jobs"]
-  schedule = "*/30 * * * *"
+  schedule = "0 */10 * * *"

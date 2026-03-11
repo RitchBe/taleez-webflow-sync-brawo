@@ -151,8 +151,10 @@ function mapJobToWebflow(job, nowIso) {
   const slug = `${slugify(title)}-${taleezId}`.slice(0, 240);
 
   // refine later once you confirm Taleez statuses
-  const isActive = job.visibility === "PUBLIC" && job.currentStatus !== "DONE";
-
+const ACTIVE_VISIBILITY = new Set(["PUBLIC", "INTERNAL_AND_PUBLIC"]);
+const isActive =
+  ACTIVE_VISIBILITY.has(job.visibility) &&
+  job.currentStatus === "PUBLISHED";
 
 
   return {
@@ -296,8 +298,20 @@ export async function handler(event) {
     }
 
     // 6) Publish active items
-    const uniquePublishIds = [...new Set([...publishIds, ...createdIdsToPublish])];
-    await wfPublish(collectionId, uniquePublishIds);
+  // Re-list items so we can publish newly created ones too
+const afterWrite = await wfListAllItems(collectionId);
+
+// Publish ONLY items that are active AND were touched in this run (safer)
+const idsToPublish = [];
+for (const item of afterWrite) {
+  const isActive = !!item?.fieldData?.["is-active"];
+  const lastSeen = item?.fieldData?.["last-seen-at"]; // stored as ISO string
+  if (isActive && lastSeen === nowIso) {
+    idsToPublish.push(item.id);
+  }
+}
+
+await wfPublishInBatches(collectionId, idsToPublish);
 
     // 7) Soft delete: mark inactive + unpublish items missing from Taleez list
     const missingIds = [];
@@ -349,5 +363,13 @@ export async function handler(event) {
         error: String(err?.message || err),
       }),
     };
+  }
+}
+
+async function wfPublishInBatches(collectionId, itemIds) {
+  const unique = [...new Set(itemIds)];
+  for (const batch of chunk(unique, 100)) {
+    await wfPublish(collectionId, batch);
+    await sleep(250);
   }
 }
