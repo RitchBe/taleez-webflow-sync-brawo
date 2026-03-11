@@ -64,8 +64,8 @@ async function wfListAllItems(collectionId) {
 }
 
 async function wfBulkCreate(collectionId, items) {
-  // Bulk create staged items
-  return wfFetch(`/collections/${collectionId}/items/bulk`, {
+  // Bulk create staged items (v2 expects { items: [{ fieldData: {...} }, ...] })
+  return wfFetch(`/collections/${collectionId}/items`, {
     method: "POST",
     body: { items },
   });
