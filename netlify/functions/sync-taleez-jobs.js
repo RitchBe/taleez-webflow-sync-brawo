@@ -110,7 +110,7 @@ async function taleezFetchAllJobs() {
     url.searchParams.set("page", String(page));
     url.searchParams.set("pageSize", String(pageSize));
     url.searchParams.set("withDetails", "true");
-    // If you want richer list payloads, you can try:
+    // If you want richer list payloads, you can trjy:
     // url.searchParams.set("withDetails", "true");
 
     const res = await fetch(url.toString(), {
