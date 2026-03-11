@@ -156,7 +156,6 @@ const isActive =
   ACTIVE_VISIBILITY.has(job.visibility) &&
   job.currentStatus === "PUBLISHED";
 
-
   return {
     fieldData: {
       // Webflow reserved:
@@ -261,22 +260,25 @@ export async function handler(event) {
     const toUpdate = [];
     const publishIds = [];
 
-    for (const job of jobs) {
-      const tId = String(job.id);
-      seen.add(tId);
+for (const job of jobs) {
+  const tId = String(job.id);
 
-      const mapped = mapJobToWebflow(job, nowIso);
-      const existingId = existingByTaleez.get(tId);
+  const mapped = mapJobToWebflow(job, nowIso);
+  const active = mapped.fieldData["is-active"] === true;
 
-      const active = !!mapped.fieldData["is-active"];
+  // ✅ Step B: skip inactive jobs completely
+  if (!active) continue;
 
-      if (existingId) {
-        toUpdate.push({ id: existingId, ...mapped });
-        if (active) publishIds.push(existingId);
-      } else {
-        toCreate.push(mapped);
-      }
-    }
+  // Now we only track/keep active ones
+  seen.add(tId);
+
+  const existingId = existingByTaleez.get(tId);
+  if (existingId) {
+    toUpdate.push({ id: existingId, ...mapped });
+  } else {
+    toCreate.push(mapped);
+  }
+}
 
     // 4) Create staged items
     const createdIdsToPublish = [];
@@ -328,15 +330,21 @@ await wfPublishInBatches(collectionId, idsToPublish);
       }
     }
 
-    for (const batch of chunk(missingUpdates, 100)) {
-      await wfBulkUpdate(collectionId, batch);
-      await sleep(250);
-    }
+ for (const batch of chunk(missingUpdates, 100)) {
+  await wfBulkUpdate(collectionId, batch);
+  await sleep(250);
+}
 
-    for (const batch of chunk(missingIds, 100)) {
-      await wfUnpublish(collectionId, batch);
-      await sleep(250);
-    }
+for (const batch of chunk(missingIds, 100)) {
+  await wfUnpublish(collectionId, batch);
+  await sleep(250);
+}
+
+// ✅ Step C: remove from CMS entirely (only keep active jobs)
+for (const batch of chunk(missingIds, 100)) {
+  await wfDeleteItems(collectionId, batch);
+  await sleep(250);
+}
 
     return {
       statusCode: 200,
@@ -370,4 +378,12 @@ async function wfPublishInBatches(collectionId, itemIds) {
     await wfPublish(collectionId, batch);
     await sleep(250);
   }
+}
+
+async function wfDeleteItems(collectionId, itemIds) {
+  if (!itemIds.length) return;
+  return wfFetch(`/collections/${collectionId}/items`, {
+    method: "DELETE",
+    body: { itemIds },
+  });
 }
