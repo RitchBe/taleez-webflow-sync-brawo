@@ -299,18 +299,16 @@ export async function handler(event) {
 
     // 6) Publish active items
   // Re-list items so we can publish newly created ones too
+// Re-list items so we can publish newly created items too
 const afterWrite = await wfListAllItems(collectionId);
 
-// Publish ONLY items that are active AND were touched in this run (safer)
+// Publish everything that is active (simple + guaranteed)
 const idsToPublish = [];
 for (const item of afterWrite) {
-  const isActive = !!item?.fieldData?.["is-active"];
-  const lastSeen = item?.fieldData?.["last-seen-at"]; // stored as ISO string
-  if (isActive && lastSeen === nowIso) {
+  if (item?.fieldData?.["is-active"] === true) {
     idsToPublish.push(item.id);
   }
 }
-
 await wfPublishInBatches(collectionId, idsToPublish);
 
     // 7) Soft delete: mark inactive + unpublish items missing from Taleez list
