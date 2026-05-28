@@ -48,7 +48,8 @@ export async function handler(event) {
         lastName,
         email,
         phone: phone || "",
-        initialReferrer: "Brawo Webflow Website" // Custom tracking tag
+        initialReferrer: "Brawo Webflow Website", // Custom tracking tag
+        bypassRequiredQuestions: true
       };
   
       const res = await fetch(url, {
