@@ -1,5 +1,7 @@
 // netlify/functions/sync-taleez-jobs.js
 
+import { schedule } from "@netlify/functions";
+
 const WF_BASE = "https://api.webflow.com/v2";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -93,6 +95,23 @@ async function wfUnpublish(collectionId, itemIds) {
   });
 }
 
+async function wfDeleteItems(collectionId, itemIds) {
+  if (!itemIds.length) return;
+  return wfFetch(`/collections/${collectionId}/items`, {
+    method: "DELETE",
+    body: { itemIds },
+  });
+}
+
+async function wfPublishInBatches(collectionId, itemIds) {
+  const unique = [...new Set(itemIds)];
+  for (const batch of chunk(unique, 100)) {
+    await wfPublish(collectionId, batch);
+    await sleep(250);
+  }
+  return unique;
+}
+
 // -------------------- Taleez --------------------
 async function taleezFetchAllJobs() {
   const base = process.env.TALEEZ_BASE_URL || "https://api.taleez.com";
@@ -110,8 +129,6 @@ async function taleezFetchAllJobs() {
     url.searchParams.set("page", String(page));
     url.searchParams.set("pageSize", String(pageSize));
     url.searchParams.set("withDetails", "true");
-    // If you want richer list payloads, you can trjy:
-    // url.searchParams.set("withDetails", "true");
 
     const res = await fetch(url.toString(), {
       headers: {
@@ -151,11 +168,9 @@ function mapJobToWebflow(job, nowIso) {
   const title = job.label || `Job ${taleezId}`;
   const slug = `${slugify(title)}-${taleezId}`.slice(0, 240);
 
-  // refine later once you confirm Taleez statuses
-const ACTIVE_VISIBILITY = new Set(["PUBLIC", "INTERNAL_AND_PUBLIC"]);
-const isActive =
-  ACTIVE_VISIBILITY.has(job.visibility) &&
-  job.currentStatus === "PUBLISHED";
+  const ACTIVE_VISIBILITY = new Set(["PUBLIC", "INTERNAL_AND_PUBLIC"]);
+  const isActive =
+    ACTIVE_VISIBILITY.has(job.visibility) && job.currentStatus === "PUBLISHED";
 
   return {
     fieldData: {
@@ -187,8 +202,8 @@ const isActive =
       "location-full": [job.city, job.postalCode, job.country]
         .filter(Boolean)
         .join(", "),
-lat: typeof job.lat === "number" ? job.lat : null,
-lng: typeof job.lng === "number" ? job.lng : null,
+      lat: typeof job.lat === "number" ? job.lat : null,
+      lng: typeof job.lng === "number" ? job.lng : null,
 
       // Company:
       "company-label": job.companyLabel || "",
@@ -221,8 +236,8 @@ lng: typeof job.lng === "number" ? job.lng : null,
   };
 }
 
-// -------------------- Handler --------------------
-export async function handler(event) {
+// -------------------- Sync logic --------------------
+const syncHandler = async (event) => {
   try {
     const collectionId = process.env.WEBFLOW_COLLECTION_ID;
     const token = process.env.WEBFLOW_TOKEN;
@@ -255,42 +270,33 @@ export async function handler(event) {
       if (tId) existingByTaleez.set(String(tId), item.id);
     }
 
-    // 3) Prepare create/update and publish list
+    // 3) Prepare create/update lists (active jobs only)
     const seen = new Set();
     const toCreate = [];
     const toUpdate = [];
-    const publishIds = [];
 
-for (const job of jobs) {
-  const tId = String(job.id);
+    for (const job of jobs) {
+      const tId = String(job.id);
+      const mapped = mapJobToWebflow(job, nowIso);
+      const active = mapped.fieldData["is-active"] === true;
 
-  const mapped = mapJobToWebflow(job, nowIso);
-  const active = mapped.fieldData["is-active"] === true;
+      // Skip inactive jobs completely
+      if (!active) continue;
 
-  // ✅ Step B: skip inactive jobs completely
-  if (!active) continue;
+      // Only track/keep active ones
+      seen.add(tId);
 
-  // Now we only track/keep active ones
-  seen.add(tId);
-
-  const existingId = existingByTaleez.get(tId);
-  if (existingId) {
-    toUpdate.push({ id: existingId, ...mapped });
-  } else {
-    toCreate.push(mapped);
-  }
-}
+      const existingId = existingByTaleez.get(tId);
+      if (existingId) {
+        toUpdate.push({ id: existingId, ...mapped });
+      } else {
+        toCreate.push(mapped);
+      }
+    }
 
     // 4) Create staged items
-    const createdIdsToPublish = [];
     for (const batch of chunk(toCreate, 100)) {
-      const created = await wfBulkCreate(collectionId, batch);
-
-      // Webflow sometimes returns created items with ids
-      const createdItems = created?.items || [];
-      for (const it of createdItems) {
-        if (it?.fieldData?.["is-active"]) createdIdsToPublish.push(it.id);
-      }
+      await wfBulkCreate(collectionId, batch);
       await sleep(250);
     }
 
@@ -300,52 +306,30 @@ for (const job of jobs) {
       await sleep(250);
     }
 
-    // 6) Publish active items
-  // Re-list items so we can publish newly created ones too
-// Re-list items so we can publish newly created items too
-const afterWrite = await wfListAllItems(collectionId);
+    // 6) Publish every active item (re-list so newly created ones are included)
+    const afterWrite = await wfListAllItems(collectionId);
+    const idsToPublish = afterWrite
+      .filter((item) => item?.fieldData?.["is-active"] === true)
+      .map((item) => item.id);
+    const publishedIds = await wfPublishInBatches(collectionId, idsToPublish);
 
-// Publish everything that is active (simple + guaranteed)
-const idsToPublish = [];
-for (const item of afterWrite) {
-  if (item?.fieldData?.["is-active"] === true) {
-    idsToPublish.push(item.id);
-  }
-}
-await wfPublishInBatches(collectionId, idsToPublish);
-
-    // 7) Soft delete: mark inactive + unpublish items missing from Taleez list
+    // 7) Hard delete: items missing from the Taleez active list
     const missingIds = [];
-    const missingUpdates = [];
-
     for (const item of existing) {
       const tId = String(item?.fieldData?.["taleez-id"] || "");
       if (!tId) continue;
-
-      if (!seen.has(tId)) {
-        missingIds.push(item.id);
-        missingUpdates.push({
-          id: item.id,
-          fieldData: { "is-active": false },
-        });
-      }
+      if (!seen.has(tId)) missingIds.push(item.id);
     }
 
- for (const batch of chunk(missingUpdates, 100)) {
-  await wfBulkUpdate(collectionId, batch);
-  await sleep(250);
-}
-
-for (const batch of chunk(missingIds, 100)) {
-  await wfUnpublish(collectionId, batch);
-  await sleep(250);
-}
-
-// ✅ Step C: remove from CMS entirely (only keep active jobs)
-for (const batch of chunk(missingIds, 100)) {
-  await wfDeleteItems(collectionId, batch);
-  await sleep(250);
-}
+    // Unpublish (remove from live) then delete from the CMS entirely
+    for (const batch of chunk(missingIds, 100)) {
+      await wfUnpublish(collectionId, batch);
+      await sleep(250);
+    }
+    for (const batch of chunk(missingIds, 100)) {
+      await wfDeleteItems(collectionId, batch);
+      await sleep(250);
+    }
 
     return {
       statusCode: 200,
@@ -356,8 +340,8 @@ for (const batch of chunk(missingIds, 100)) {
         webflowExisting: existing.length,
         created: toCreate.length,
         updated: toUpdate.length,
-        published: uniquePublishIds.length,
-        unpublished: missingIds.length,
+        published: publishedIds.length,
+        deleted: missingIds.length,
         runAt: nowIso,
       }),
     };
@@ -371,20 +355,8 @@ for (const batch of chunk(missingIds, 100)) {
       }),
     };
   }
-}
+};
 
-async function wfPublishInBatches(collectionId, itemIds) {
-  const unique = [...new Set(itemIds)];
-  for (const batch of chunk(unique, 100)) {
-    await wfPublish(collectionId, batch);
-    await sleep(250);
-  }
-}
-
-async function wfDeleteItems(collectionId, itemIds) {
-  if (!itemIds.length) return;
-  return wfFetch(`/collections/${collectionId}/items`, {
-    method: "DELETE",
-    body: { itemIds },
-  });
-}
+// Runs on Netlify's schedule. Change "@hourly" to "@daily", or a cron
+// expression like "0 */6 * * *" (every 6 hours), as needed.
+export const handler = schedule("@hourly", syncHandler);
