@@ -1,7 +1,5 @@
 // netlify/functions/sync-taleez-jobs.js
 
-import { schedule } from "@netlify/functions";
-
 const WF_BASE = "https://api.webflow.com/v2";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -357,6 +355,5 @@ const syncHandler = async (event) => {
   }
 };
 
-// Runs on Netlify's schedule. Change "@hourly" to "@daily", or a cron
-// expression like "0 */6 * * *" (every 6 hours), as needed.
-export const handler = schedule("@hourly", syncHandler);
+// Scheduling is configured in netlify.toml (no npm dependency needed).
+export const handler = syncHandler;
