@@ -1,7 +1,24 @@
 // netlify/functions/sync-taleez-jobs.js
+//
+// SCHEDULED function, free-tier friendly. Hard 30s ceiling, so this is built to:
+//   1. do only the work that actually changed (skip unchanged jobs entirely),
+//   2. publish brand-new / changed / not-yet-live items only,
+//   3. stay idempotent + RESUMABLE under a soft time budget — if a run can't
+//      finish, it does what it can and the next run continues. No mid-run crash.
+//
+// Schedule lives in netlify.toml:
+//   [functions."sync-taleez-jobs"]
+//     schedule = "@hourly"
 
 const WF_BASE = "https://api.webflow.com/v2";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Stop starting new work ~7s before the 30s wall, to leave room to return.
+const SOFT_BUDGET_MS = 23000;
+
+// Fields this sync owns. Used for change detection. "last-seen-at" is excluded
+// because it changes every run and would make everything look "changed".
+const VOLATILE_FIELDS = new Set(["last-seen-at"]);
 
 function toIsoFromUnixSeconds(sec) {
   if (!sec) return null;
@@ -20,6 +37,26 @@ function chunk(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
+}
+
+// Normalize a field value so "", null, undefined and missing keys all compare
+// equal, and everything else compares by JSON value.
+function norm(v) {
+  return v === null || v === undefined || v === "" ? "" : JSON.stringify(v);
+}
+
+// True if the managed fields differ between what we'd write and what's stored.
+function fieldsChanged(mappedFieldData, existingFieldData = {}) {
+  for (const key of Object.keys(mappedFieldData)) {
+    if (VOLATILE_FIELDS.has(key)) continue;
+    if (norm(mappedFieldData[key]) !== norm(existingFieldData[key])) return true;
+  }
+  return false;
+}
+
+// An item needs publishing if it's never been published or is still a draft.
+function needsPublish(item) {
+  return !item?.lastPublished || item?.isDraft === true;
 }
 
 // -------------------- Webflow (Data API v2) --------------------
@@ -56,13 +93,12 @@ async function wfListAllItems(collectionId) {
     all.push(...items);
     if (items.length < limit) break;
     offset += limit;
-    await sleep(150);
+    await sleep(120);
   }
   return all;
 }
 
 async function wfBulkCreate(collectionId, items) {
-  // Bulk create staged items
   return wfFetch(`/collections/${collectionId}/items`, {
     method: "POST",
     body: { items },
@@ -70,7 +106,6 @@ async function wfBulkCreate(collectionId, items) {
 }
 
 async function wfBulkUpdate(collectionId, items) {
-  // Bulk update staged items
   return wfFetch(`/collections/${collectionId}/items`, {
     method: "PATCH",
     body: { items },
@@ -99,15 +134,6 @@ async function wfDeleteItems(collectionId, itemIds) {
     method: "DELETE",
     body: { itemIds },
   });
-}
-
-async function wfPublishInBatches(collectionId, itemIds) {
-  const unique = [...new Set(itemIds)];
-  for (const batch of chunk(unique, 100)) {
-    await wfPublish(collectionId, batch);
-    await sleep(250);
-  }
-  return unique;
 }
 
 // -------------------- Taleez --------------------
@@ -236,6 +262,10 @@ function mapJobToWebflow(job, nowIso) {
 
 // -------------------- Sync logic --------------------
 const syncHandler = async (event) => {
+  const startedAt = Date.now();
+  const deadline = startedAt + SOFT_BUDGET_MS;
+  const haveTime = () => Date.now() < deadline;
+
   try {
     const collectionId = process.env.WEBFLOW_COLLECTION_ID;
     const token = process.env.WEBFLOW_TOKEN;
@@ -245,101 +275,127 @@ const syncHandler = async (event) => {
 
     const minExpected = Number(process.env.MIN_EXPECTED_COUNT || "0");
     const nowIso = new Date().toISOString();
-
     const isScheduled = event?.headers?.["x-nf-scheduled"] === "true";
 
     // 1) Taleez jobs
     const jobs = await taleezFetchAllJobs();
 
-    // Guardrail
+    // Guardrail: refuse to proceed (and possibly delete) on a suspicious fetch.
     if (minExpected && jobs.length < minExpected) {
       throw new Error(
         `Safety stop: Taleez returned ${jobs.length} jobs (< ${minExpected}).`
       );
     }
 
-    // 2) Existing Webflow items
+    // 2) Existing Webflow items (single full pass)
     const existing = await wfListAllItems(collectionId);
-
-    // Map: taleez-id -> webflow item id
     const existingByTaleez = new Map();
     for (const item of existing) {
       const tId = item?.fieldData?.["taleez-id"];
-      if (tId) existingByTaleez.set(String(tId), item.id);
+      if (tId) existingByTaleez.set(String(tId), item);
     }
 
-    // 3) Prepare create/update lists (active jobs only)
+    // 3) Build the plan in memory (NO api calls — always completes).
+    //    `seen` is the complete set of currently-active Taleez jobs, so the
+    //    delete step below is safe even if writes get truncated by the budget.
     const seen = new Set();
     const toCreate = [];
     const toUpdate = [];
+    const publishIds = new Set();
 
     for (const job of jobs) {
       const tId = String(job.id);
       const mapped = mapJobToWebflow(job, nowIso);
       const active = mapped.fieldData["is-active"] === true;
 
-      // Skip inactive jobs completely
-      if (!active) continue;
-
-      // Only track/keep active ones
+      if (!active) continue; // ignore inactive jobs entirely
       seen.add(tId);
 
-      const existingId = existingByTaleez.get(tId);
-      if (existingId) {
-        toUpdate.push({ id: existingId, ...mapped });
-      } else {
-        toCreate.push(mapped);
+      const existingItem = existingByTaleez.get(tId);
+
+      if (!existingItem) {
+        toCreate.push(mapped); // new -> create + publish
+      } else if (fieldsChanged(mapped.fieldData, existingItem.fieldData)) {
+        toUpdate.push({ id: existingItem.id, ...mapped }); // changed -> update + publish
+        publishIds.add(existingItem.id);
+      } else if (needsPublish(existingItem)) {
+        // unchanged, but not live yet (e.g. created by a previous truncated run)
+        publishIds.add(existingItem.id);
+      }
+      // else: unchanged AND already live -> do nothing
+    }
+
+    // 4) Create new items (budgeted). Collect their IDs to publish.
+    let partial = false;
+    let created = 0;
+    for (const batch of chunk(toCreate, 100)) {
+      if (!haveTime()) { partial = true; break; }
+      const res = await wfBulkCreate(collectionId, batch);
+      for (const it of res?.items || []) {
+        if (it?.id) publishIds.add(it.id);
+      }
+      created += batch.length;
+      await sleep(200);
+    }
+
+    // 5) Update changed items (budgeted)
+    let updated = 0;
+    if (!partial) {
+      for (const batch of chunk(toUpdate, 100)) {
+        if (!haveTime()) { partial = true; break; }
+        await wfBulkUpdate(collectionId, batch);
+        updated += batch.length;
+        await sleep(200);
       }
     }
 
-    // 4) Create staged items
-    for (const batch of chunk(toCreate, 100)) {
-      await wfBulkCreate(collectionId, batch);
-      await sleep(250);
+    // 6) Publish everything that's new / changed / not-yet-live (budgeted)
+    let published = 0;
+    const publishList = [...publishIds];
+    for (const batch of chunk(publishList, 100)) {
+      if (!haveTime()) { partial = true; break; }
+      await wfPublish(collectionId, batch);
+      published += batch.length;
+      await sleep(200);
     }
 
-    // 5) Update staged items
-    for (const batch of chunk(toUpdate, 100)) {
-      await wfBulkUpdate(collectionId, batch);
-      await sleep(250);
-    }
-
-    // 6) Publish every active item (re-list so newly created ones are included)
-    const afterWrite = await wfListAllItems(collectionId);
-    const idsToPublish = afterWrite
-      .filter((item) => item?.fieldData?.["is-active"] === true)
-      .map((item) => item.id);
-    const publishedIds = await wfPublishInBatches(collectionId, idsToPublish);
-
-    // 7) Hard delete: items missing from the Taleez active list
+    // 7) Remove items that are no longer in Taleez's active list.
+    //    Safe because `seen` is complete. Only runs if we still have budget;
+    //    otherwise it's deferred to the next run (deletes are idempotent).
     const missingIds = [];
     for (const item of existing) {
       const tId = String(item?.fieldData?.["taleez-id"] || "");
-      if (!tId) continue;
-      if (!seen.has(tId)) missingIds.push(item.id);
+      if (tId && !seen.has(tId)) missingIds.push(item.id);
     }
 
-    // Unpublish (remove from live) then delete from the CMS entirely
-    for (const batch of chunk(missingIds, 100)) {
-      await wfUnpublish(collectionId, batch);
-      await sleep(250);
-    }
-    for (const batch of chunk(missingIds, 100)) {
-      await wfDeleteItems(collectionId, batch);
-      await sleep(250);
+    let deleted = 0;
+    if (!partial && missingIds.length) {
+      for (const batch of chunk(missingIds, 100)) {
+        if (!haveTime()) { partial = true; break; }
+        await wfUnpublish(collectionId, batch); // remove from live
+        await wfDeleteItems(collectionId, batch); // remove from CMS
+        deleted += batch.length;
+        await sleep(200);
+      }
+    } else if (missingIds.length) {
+      partial = true; // had deletions to do but ran out of budget
     }
 
     return {
       statusCode: 200,
       body: JSON.stringify({
         ok: true,
+        partial, // true => some work deferred to the next scheduled run
         scheduled: isScheduled,
         taleezJobs: jobs.length,
         webflowExisting: existing.length,
-        created: toCreate.length,
-        updated: toUpdate.length,
-        published: publishedIds.length,
-        deleted: missingIds.length,
+        created,
+        updated,
+        published,
+        deleted,
+        skippedUnchanged:
+          seen.size - created - updated, // active jobs that needed no write
+        elapsedMs: Date.now() - startedAt,
         runAt: nowIso,
       }),
     };
@@ -347,10 +403,7 @@ const syncHandler = async (event) => {
     console.error("SYNC ERROR:", err?.stack || err);
     return {
       statusCode: 500,
-      body: JSON.stringify({
-        ok: false,
-        error: String(err?.message || err),
-      }),
+      body: JSON.stringify({ ok: false, error: String(err?.message || err) }),
     };
   }
 };
