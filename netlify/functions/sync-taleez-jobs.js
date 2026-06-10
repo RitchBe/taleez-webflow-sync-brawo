@@ -88,9 +88,12 @@ async function wfPublish(collectionId, itemIds) {
 }
 async function wfDelete(collectionId, itemIds) {
   if (!itemIds.length) return;
+  // NOTE: unlike publish (which takes `itemIds`), the delete endpoints
+  // expect `{ items: [{ id }, ...] }`.
+  const items = itemIds.map((id) => ({ id }));
   // remove from the live site, then from the CMS
-  await wfFetch(`/collections/${collectionId}/items/live`, { method: "DELETE", body: { itemIds } });
-  await wfFetch(`/collections/${collectionId}/items`, { method: "DELETE", body: { itemIds } });
+  await wfFetch(`/collections/${collectionId}/items/live`, { method: "DELETE", body: { items } });
+  await wfFetch(`/collections/${collectionId}/items`, { method: "DELETE", body: { items } });
 }
 
 // -------------------- Taleez --------------------
