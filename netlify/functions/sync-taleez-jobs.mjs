@@ -196,27 +196,37 @@ function isActive(job) {
 export default async function handler() {
   try {
     const collectionId = process.env.WEBFLOW_COLLECTION_ID;
-    if (!process.env.WEBFLOW_TOKEN) throw new Error("Missing WEBFLOW_TOKEN");
-    if (!collectionId) throw new Error("Missing WEBFLOW_COLLECTION_ID");
+
+    if (!process.env.WEBFLOW_TOKEN) {
+      throw new Error("Missing WEBFLOW_TOKEN");
+    }
+
+    if (!collectionId) {
+      throw new Error("Missing WEBFLOW_COLLECTION_ID");
+    }
 
     const nowIso = new Date().toISOString();
     const minExpected = Number(process.env.MIN_EXPECTED_COUNT || "0");
 
     // 1) Active jobs from Taleez
     const jobs = (await taleezFetchActiveJobs()).filter(isActive);
+
     if (minExpected && jobs.length < minExpected) {
-      throw new Error(`Safety stop: only ${jobs.length} active jobs (< ${minExpected}).`);
+      throw new Error(
+        `Safety stop: only ${jobs.length} active jobs (< ${minExpected}).`
+      );
     }
 
     // 2) What's already in Webflow
     const existing = await wfListAllItems(collectionId);
     const byTaleezId = new Map();
+
     for (const item of existing) {
       const tId = item?.fieldData?.["taleez-id"];
       if (tId) byTaleezId.set(String(tId), item);
     }
 
-    // 3) Decide create / update, and collect every active item's id to publish
+    // 3) Decide create/update
     const seen = new Set();
     const toCreate = [];
     const toUpdate = [];
@@ -225,6 +235,7 @@ export default async function handler() {
     for (const job of jobs) {
       const tId = String(job.id);
       seen.add(tId);
+
       const fields = mapJob(job, nowIso);
       const current = byTaleezId.get(tId);
 
@@ -232,64 +243,80 @@ export default async function handler() {
         toCreate.push({ fieldData: fields });
       } else {
         activeIds.push(current.id);
+
         if (hasChanged(fields, current.fieldData)) {
-          toUpdate.push({ id: current.id, fieldData: fields });
+          toUpdate.push({
+            id: current.id,
+            fieldData: fields,
+          });
         }
       }
     }
 
     // 4) Create
     let created = 0;
+
     for (const batch of chunk(toCreate, 100)) {
       const res = await wfCreate(collectionId, batch);
-      for (const it of res?.items || []) if (it?.id) activeIds.push(it.id);
+
+      for (const item of res?.items || []) {
+        if (item?.id) activeIds.push(item.id);
+      }
+
       created += batch.length;
       await sleep(200);
     }
 
-    // 5) Update changed
+    // 5) Update
     let updated = 0;
+
     for (const batch of chunk(toUpdate, 100)) {
       await wfUpdate(collectionId, batch);
       updated += batch.length;
       await sleep(200);
     }
 
-    // 6) Publish all active items
+    // 6) Publish
     for (const batch of chunk([...new Set(activeIds)], 100)) {
       await wfPublish(collectionId, batch);
       await sleep(200);
     }
 
-    // 7) Delete anything in Webflow that isn't an active job
+    // 7) Delete stale items
     const stale = existing
-      .filter((it) => {
-        const tId = String(it?.fieldData?.["taleez-id"] || "");
+      .filter((item) => {
+        const tId = String(item?.fieldData?.["taleez-id"] || "");
         return tId && !seen.has(tId);
       })
-      .map((it) => it.id);
+      .map((item) => item.id);
 
     let deleted = 0;
+
     for (const batch of chunk(stale, 100)) {
       await wfDelete(collectionId, batch);
       deleted += batch.length;
       await sleep(200);
     }
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
+    console.log(
+      JSON.stringify({
+        event: "taleez-sync-completed",
         ok: true,
         activeJobs: jobs.length,
         created,
         updated,
         deleted,
         runAt: nowIso,
-      }),
-    };
+      })
+    );
+
+    // Scheduled functions should return undefined.
+    return;
   } catch (err) {
     console.error("SYNC ERROR:", err?.stack || err);
-    return { statusCode: 500, body: JSON.stringify({ ok: false, error: String(err?.message || err) }) };
+
+    // Throwing marks the scheduled invocation as failed in Netlify.
+    throw err;
   }
 }
 
