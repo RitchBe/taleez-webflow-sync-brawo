@@ -193,7 +193,7 @@ function isActive(job) {
 }
 
 // -------------------- Handler --------------------
-export const handler = async () => {
+export default async function handler() {
   try {
     const collectionId = process.env.WEBFLOW_COLLECTION_ID;
     if (!process.env.WEBFLOW_TOKEN) throw new Error("Missing WEBFLOW_TOKEN");
@@ -291,4 +291,8 @@ export const handler = async () => {
     console.error("SYNC ERROR:", err?.stack || err);
     return { statusCode: 500, body: JSON.stringify({ ok: false, error: String(err?.message || err) }) };
   }
+}
+
+export const config = {
+  schedule: "@hourly",
 };
