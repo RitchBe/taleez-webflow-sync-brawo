@@ -3,7 +3,7 @@
 export async function handler(event) {
   // 1. Define your CORS headers
   const headers = {
-    "Access-Control-Allow-Origin": "https://brawo.webflow.io", 
+    "Access-Control-Allow-Origin": "https://www.brawo.fr", 
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST, OPTIONS"
   };
